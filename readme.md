@@ -74,3 +74,137 @@ We are happy to help if you have any questions. Please contact email our Support
 [3]: mailto:hello@codecov.io
 [4]: https://github.com/codecov/codecov-python
 [5]: https://simonkagstrom.github.io/kcov
+
+
+
+
+
+
+
+
+
+  static QueueFile createQueueFile(File folder, String name) throws IOException {
+    createDirectory(folder);
+    File file = new File(folder, name);
+    try {
+      return new QueueFile(file);
+    } catch (IOException e) {
+      //noinspection ResultOfMethodCallIgnored
+      if (file.delete()) {
+        return new QueueFile(file);
+      } else {
+        throw new IOException("Could not create queue file (" + name + ") in " + folder + ".");
+      }
+    }
+  }
+  static synchronized SegmentIntegration create(
+      Context context,
+      Client client,
+      Cartographer cartographer,
+      ExecutorService networkExecutor,
+      Stats stats,
+      Map<String, Boolean> bundledIntegrations,
+      String tag,
+      long flushIntervalInMillis,
+      int flushQueueSize,
+      Logger logger,
+      Crypto crypto) {
+    PayloadQueue payloadQueue;
+    try {
+      File folder = context.getDir("segment-disk-queue", Context.MODE_PRIVATE);
+      QueueFile queueFile = createQueueFile(folder, tag);
+      payloadQueue = new PayloadQueue.PersistentQueue(queueFile);
+    } catch (IOException e) {
+      logger.error(e, "Could not create disk queue. Falling back to memory queue.");
+      payloadQueue = new PayloadQueue.MemoryQueue();
+    }
+    return new SegmentIntegration(
+        context,
+        client,
+        cartographer,
+        networkExecutor,
+        payloadQueue,
+        stats,
+        bundledIntegrations,
+        flushIntervalInMillis,
+        flushQueueSize,
+        logger,
+        crypto);
+  }
+  SegmentIntegration(
+      Context context,
+      Client client,
+      Cartographer cartographer,
+      ExecutorService networkExecutor,
+      PayloadQueue payloadQueue,
+      Stats stats,
+      Map<String, Boolean> bundledIntegrations,
+      long flushIntervalInMillis,
+      int flushQueueSize,
+      Logger logger,
+      Crypto crypto) {
+    this.context = context;
+    this.client = client;
+    this.networkExecutor = networkExecutor;
+    this.payloadQueue = payloadQueue;
+    this.stats = stats;
+    this.logger = logger;
+    this.bundledIntegrations = bundledIntegrations;
+    this.cartographer = cartographer;
+    this.flushQueueSize = flushQueueSize;
+    this.flushScheduler = Executors.newScheduledThreadPool(1, new AnalyticsThreadFactory());
+    this.crypto = crypto;
+    segmentThread = new HandlerThread(SEGMENT_THREAD_NAME, THREAD_PRIORITY_BACKGROUND);
+    segmentThread.start();
+    handler = new SegmentDispatcherHandler(segmentThread.getLooper(), this);
+    long initialDelay = payloadQueue.size() >= flushQueueSize ? 0L : flushIntervalInMillis;
+    flushScheduler.scheduleAtFixedRate(
+        new Runnable() {
+          @Override
+          public void run() {
+            flush();
+          }
+        },
+        initialDelay,
+        flushIntervalInMillis,
+        TimeUnit.MILLISECONDS);
+  }
+  @Override
+  public void identify(IdentifyPayload identify) {
+    dispatchEnqueue(identify);
+  }
+  @Override
+  public void group(GroupPayload group) {
+    dispatchEnqueue(group);
+  }
+  @Override
+  public void track(TrackPayload track) {
+    dispatchEnqueue(track);
+  }
+  @Override
+  public void alias(AliasPayload alias) {
+    dispatchEnqueue(alias);
+  }
+  @Override
+  public void screen(ScreenPayload screen) {
+    dispatchEnqueue(screen);
+  }
+  private void dispatchEnqueue(BasePayload payload) {
+    handler.sendMessage(handler.obtainMessage(SegmentDispatcherHandler.REQUEST_ENQUEUE, payload));
+  }
+  void performEnqueue(BasePayload original) {
+    // Override any user provided values with anything that was bundled.
+    // e.g. If user did Mixpanel: true and it was bundled, this would correctly override it with
+    // false so that the server doesn't send that event as well.
+    ValueMap providedIntegrations = original.integrations();
+    LinkedHashMap<String, Object> combinedIntegrations =
+        new LinkedHashMap<>(providedIntegrations.size() + bundledIntegrations.size());
+    combinedIntegrations.putAll(providedIntegrations);
+    combinedIntegrations.putAll(bundledIntegrations);
+    combinedIntegrations.remove("Segment.io"); // don't include the Segment integration.
+    // Make a copy of the payload so we don't mutate the original.
+    ValueMap payload = new ValueMap();
+    payload.putAll(original);
+    payload.put("integrations", combinedIntegrations);
+    if (payloadQueue.size() >= MAX_QUEUE_SIZE) {
+      synchronized (flushLock) {
